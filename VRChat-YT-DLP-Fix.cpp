@@ -193,8 +193,9 @@ void GuardLoop(
         {
             needReplace = true;
             if (std::filesystem::exists(ytDlpPath)) {
-                std::filesystem::remove(ytDlpPath);
-                std::cout << "\nDeleting VRChat's custom YT-DLP from " << ytDlpPath << std::endl;
+                // avoid exceptions thrown (if VRChat is using the file)
+                std::error_code _;
+                std::filesystem::remove(ytDlpPath, _) && std::cout << "\nDeleting VRChat's custom YT-DLP from " << ytDlpPath << std::endl;
             }
         }
 
@@ -419,7 +420,15 @@ int worker()
 
 void workerProcess()
 {
-    exit(worker());
+    int ret = 0;
+    try {
+        ret = worker();
+    } catch (std::exception &e) {
+        ErrorExit("ERROR: Uncaught exception: ", e.what());
+    } catch (...) {
+        ErrorExit("ERROR: Unknown exception.");
+    }
+    exit(ret);
 }
 
 int main()
