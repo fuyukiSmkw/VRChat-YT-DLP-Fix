@@ -3,12 +3,57 @@
 #include <iostream>
 #include <filesystem>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
-#include <wininet.h>
-#pragma comment(lib, "wininet.lib") 
+#include "tray.hpp"
+
+std::filesystem::path GetSelfDirectory()
+{
+    wchar_t buffer[MAX_PATH];
+    GetModuleFileNameW(NULL, buffer, MAX_PATH);
+    return std::filesystem::path(buffer).parent_path();
+}
+
+bool DownloadFile(const std::string& url, const std::filesystem::path& outPath)
+{
+    std::string command =
+        "powershell -NoProfile -Command \""
+        "$ProgressPreference='SilentlyContinue'; "
+        "Invoke-WebRequest -Uri '" + url +
+        "' -OutFile '" + outPath.string() +
+        "'\"";
+
+    std::cout << "Downloading via PowerShell..." << std::endl;
+
+    int result = std::system(command.c_str());
+    if (result != 0)
+    {
+        std::cerr << "PowerShell download failed. Exit code: " << result << std::endl;
+        return false;
+    }
+
+    if (!std::filesystem::exists(outPath))
+    {
+        std::cerr << "Download reported success but file is missing: "
+                  << outPath << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+void UnblockFile(const std::filesystem::path& file)
+{
+    std::wstring cmd = L"powershell -NoProfile -Command \"Unblock-File -Path '"
+        + file.wstring() + L"'\"";
+    _wsystem(cmd.c_str());
+    cmd = L"icacls \"" + file.wstring() + L"\" /setintegritylevel M >nul";
+    _wsystem(cmd.c_str());
+}
+
 
 // Function to check if a process is running
-bool IsProcessRunning(const std::wstring & processName)
+bool IsProcessRunning(const std::string & processName)
 {
     bool isRunning = false;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -32,17 +77,12 @@ bool IsProcessRunning(const std::wstring & processName)
     return isRunning;
 }
 
-bool CheckIfGameRunning(const std::filesystem::path& cleanupFile)
+bool CheckIfGameRunning()
 {
-    if (!IsProcessRunning(L"VRChat.exe"))
+    if (!IsProcessRunning("VRChat.exe"))
     {
         std::cout << "VRChat no longer running, exiting!" << std::endl;
-        if (std::filesystem::exists(cleanupFile))
-        {
-            std::filesystem::remove(cleanupFile);
-            std::cout << "Cleaned up file: " << cleanupFile << std::endl;
-        }
-        Sleep(10000);
+        exit(0);
         return false;
     }
     return true;
@@ -95,18 +135,132 @@ std::string GetDefaultWebBrowser()
     return {};
 }
 
-int main()
+bool IsSameFileQuick(const std::filesystem::path& a, const std::filesystem::path& b)
 {
+    if (!std::filesystem::exists(a) || !std::filesystem::exists(b))
+        return false;
+
+    if (std::filesystem::file_size(a) != std::filesystem::file_size(b))
+        return false;
+
+    std::ifstream fa(a, std::ios::binary);
+    std::ifstream fb(b, std::ios::binary);
+    if (!fa || !fb) return false;
+
+    constexpr size_t BUF = 4096;
+    char ba[BUF], bb[BUF];
+
+    while (fa && fb)
+    {
+        fa.read(ba, BUF);
+        fb.read(bb, BUF);
+        if (std::memcmp(ba, bb, fa.gcount()) != 0)
+            return false;
+    }
+
+    return true;
+}
+
+template<typename... Args>
+void ErrorExit(Args&&... args)
+{
+    ShowFromOtherProcess();
+    (std::cerr << ... << std::forward<Args>(args)) << std::endl << std::endl;
+    system("pause");
+    exit(1);
+}
+
+void GuardLoop(
+    const std::filesystem::path& localYtDlp,
+    const std::filesystem::path& ytDlpPath
+)
+{
+    std::cout << "\nEntering guard loop..." << std::endl;
+
+    while (true)
+    {
+        if (!CheckIfGameRunning())
+            return;
+
+        bool needReplace = false;
+
+        if (!std::filesystem::exists(ytDlpPath))
+        {
+            needReplace = true;
+            std::cout << "VRChat's yt-dlp doesn't exist" << std::endl;
+        }
+        else if (!IsSameFileQuick(localYtDlp, ytDlpPath))
+        {
+            needReplace = true;
+            if (std::filesystem::exists(ytDlpPath)) {
+                std::filesystem::remove(ytDlpPath);
+                std::cout << "\nDeleting VRChat's custom YT-DLP from " << ytDlpPath << std::endl;
+            }
+        }
+
+        if (needReplace)
+        {
+            std::cout << "\nWait 20s for response..." << std::endl;
+
+            bool appeared = false;
+            for (int i = 0; i < 20; i++)
+            {
+                if (std::filesystem::exists(ytDlpPath))
+                {
+                    appeared = true;
+                    break;
+                }
+                Sleep(1000);
+            }
+
+            if (appeared)
+            {
+                std::cout << "Waiting for VRChat to finish writing its custom YT-DLP..." << std::endl;
+                while (IsFileInUse(ytDlpPath))
+                {
+                    if (!CheckIfGameRunning())
+                        return;
+                    Sleep(100);
+                }
+                std::filesystem::remove(ytDlpPath);
+                std::cout << "Deleting VRChat's custom YT-DLP again lol." << std::endl;
+            }
+            else
+                std::cout << "Waited 20s without VRChat replacing YT-DLP, proceeding.\n" << std::endl;
+
+            if (std::filesystem::exists(localYtDlp)) {
+                std::filesystem::copy_file(
+                    localYtDlp,
+                    ytDlpPath,
+                    std::filesystem::copy_options::overwrite_existing
+                );
+
+                UnblockFile(ytDlpPath);
+            }
+            else {
+                ErrorExit("ERROR: local yt-dlp doesn't exist!");
+            }
+
+            std::cout << "yt-dlp replaced!" << std::endl;
+            std::cout << "Waiting for next yt-dlp replacement..." << std::endl;
+        }
+
+        Sleep(3000); // check every 3s
+    }
+}
+
+int worker()
+{
+    std::cout << "======\nVRChat-YT-DLP-Fix by ShizCalev, fuyukiS' fork\nhttps://github.com/fuyukiSmkw/VRChat-YT-DLP-Fix\n======\n" << std::endl;
+
     std::cout << "Checking if VRChat is running." << std::endl;
 
     int count = 0;
-    while (!IsProcessRunning(L"VRChat.exe"))
+    while (!IsProcessRunning("VRChat.exe"))
     {
         if (count >= 30) // seconds
         {
-            std::cout << "Exceeded maximum wait time. VRChat.exe not found." << std::endl;
-            Sleep(10000);
-            return 0;
+            ErrorExit("ERROR: Exceeded maximum wait time, VRChat.exe not found.");
         }
         if (!count)
         {
@@ -116,29 +270,23 @@ int main()
         count++;
     }
 
-    std::cout << "VRChat found." << "\n" << std::endl;
+    std::cout << "VRChat.exe found." << "\n" << std::endl;
 
-    // Retrieve the AppData path using _dupenv_s
-    char* appDataPath = nullptr;
-    size_t len = 0;
-    if (_dupenv_s(&appDataPath, &len, "LOCALAPPDATA") != 0 || appDataPath == nullptr)
+    // Retrieve the AppData path (mingw)
+    const char* appDataPath = std::getenv("LOCALAPPDATA");
+    if (!appDataPath)
     {
-        std::cerr << "Error: Unable to retrieve LOCALAPPDATA environment variable." << std::endl;
-        Sleep(10000);
-        return 0;
+        ErrorExit("ERROR: Unable to retrieve LOCALAPPDATA environment variable.");
     }
 
     std::string appDataPathStr(appDataPath);
-    free(appDataPath); // Free the allocated memory
     std::filesystem::path ytDlpConfig = std::filesystem::weakly_canonical(appDataPathStr + R"(\..\Roaming\yt-dlp\config)");
     if (std::filesystem::exists(ytDlpConfig))
     {
         std::ifstream file(ytDlpConfig);
         if (!file.is_open())
         {
-            std::cerr << "Error opening file: " << ytDlpConfig << "\n" << std::endl;
-            Sleep(10000);
-            return 0;
+            ErrorExit("ERROR: Error opening file: ", ytDlpConfig);
         }
         std::cout << "yt-dlp config found at " << ytDlpConfig << "\nFile Contents:" << std::endl;
         std::ostringstream buffer;
@@ -175,11 +323,10 @@ int main()
         std::ofstream outFile(ytDlpConfig, std::ios::trunc);
         if (!outFile.is_open())
         {
-            std::cerr << "Error opening file for writing: " << ytDlpConfig << "\n" << std::endl;
-            Sleep(10000);
-            return 0;
+            ErrorExit("Error opening file for writing: ", ytDlpConfig);
         }
-        if (!containsCookiesFromBrowser)
+        // not enforcing --cookies-from-browser for those who want to use given local cookies with --cookies
+        /*if (!containsCookiesFromBrowser)
         {
             std::cout << "--cookies-from-browser parameter not located in config. Checking system registry for default web browser ProgId." << std::endl;
             std::string defaultBrowser = GetDefaultWebBrowser();
@@ -192,7 +339,7 @@ int main()
             std::cout << "Browser detected as: " << defaultBrowser << std::endl;
             outFile << "--cookies-from-browser " << defaultBrowser << " ";
             std::cout << "\"--cookies-from-browser " << defaultBrowser << "\" prepended to the yt-dlp config file." << std::endl;
-        }
+        }*/
         if (!containsSleepRequests)
         {
             outFile << "--sleep-requests 1.5 ";
@@ -216,162 +363,68 @@ int main()
     {
         std::cout << "yt-dlp config file not found. Creating default config in " << ytDlpConfig.parent_path() << "\n" << std::endl;
 
-        std::string defaultBrowser = GetDefaultWebBrowser();
-        if (defaultBrowser.empty())
-        {
-            std::cerr << "ERROR: Failed to detect default web browser from registry or browser not recognized." << std::endl;
-            Sleep(10000);
-            return 0;
-        }
-
         if (!std::filesystem::exists(ytDlpConfig.parent_path()))
-        {
             std::filesystem::create_directories(ytDlpConfig.parent_path());
-        }
         std::ofstream outFile(ytDlpConfig);
         if (!outFile.is_open())
         {
-            std::cerr << "Error creating file: " << ytDlpConfig << "\n" << std::endl;
-            Sleep(10000);
-            return 0;
+            ErrorExit("ERROR: Error creating file: ", ytDlpConfig);
         }
-        // Write the default configuration with the default browser
-        outFile << "--cookies-from-browser " << defaultBrowser << " --sleep-requests 1.5 --min-sleep-interval 15 --max-sleep-interval 45";
+
+        std::string defaultBrowser = GetDefaultWebBrowser();
+        if (defaultBrowser.empty())
+        {
+            std::cerr << "WARNING: Failed to detect default web browser from registry or browser not recognized.\nWARNING: Ignoring browser cookies. You're likely to fail to play videos; please edit " << ytDlpConfig <<" ." << std::endl;
+        }
+        else
+            outFile << "--cookies-from-browser " << defaultBrowser << " ";
+        outFile << "--sleep-requests 1.5 --min-sleep-interval 15 --max-sleep-interval 45";
         outFile.close();
     }
 
-    if (!IsProcessRunning(L"VRChat.exe"))
-    {
-        std::cout << "\nVRChat no longer running, exiting!" << std::endl;
-        Sleep(10000);
-        return 0;
-    }
-
-    // Construct full paths and check files
+    // path to VRC's yt-dlp
     const std::filesystem::path ytDlpPath = std::filesystem::weakly_canonical(appDataPathStr + R"(\..\LocalLow\VRChat\VRChat\Tools\yt-dlp.exe)");
-    if (std::filesystem::exists(ytDlpPath))
+
+    // path to local yt-dlp
+    const std::filesystem::path selfDir = GetSelfDirectory();
+    const std::filesystem::path localYtDlp = selfDir / "yt-dlp.exe";
+
+    if (std::filesystem::exists(localYtDlp))
     {
-        std::filesystem::remove(ytDlpPath);
-        std::cout << "\nDeleting VRChat's custom YT-DLP from " << ytDlpPath << std::endl;
+        std::cout << "Using local yt-dlp.exe from: " << localYtDlp << std::endl;
     }
-
-    if (std::filesystem::exists(ytDlpPath.parent_path() / "yt-dlp-latest.exe"))
+    else
     {
-        std::filesystem::remove(ytDlpPath.parent_path() / "yt-dlp-latest.exe");
-        std::cout << "Deleting stale official YT-DLP from previous run." << std::endl;
-    }
+        std::cout << "Local yt-dlp.exe not found. Downloading latest version..." << std::endl;
 
-    if (!ytDlpPath.empty())
-    {
-        std::cout << "Downloading latest yt-dlp.exe from https://github.com/yt-dlp/yt-dlp" << std::endl;
+        const std::string downloadUrl =
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
 
-        const std::string downloadUrl = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
-        const std::filesystem::path destinationPath = ytDlpPath.parent_path() / "yt-dlp-latest.exe";
-        // Use WinINet or another library to download the file
-        HINTERNET hInternet = InternetOpen(L"yt-dlp-downloader", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
-        if (hInternet)
+        if (!DownloadFile(downloadUrl, localYtDlp))
         {
-            HINTERNET hUrl = InternetOpenUrl(hInternet, std::wstring(downloadUrl.begin(), downloadUrl.end()).c_str(), NULL, 0, INTERNET_FLAG_RELOAD, 0);
-            if (hUrl)
-            {
-                std::ofstream outFile(destinationPath, std::ios::binary);
-                if (outFile.is_open())
-                {
-                    char buffer[4096];
-                    DWORD bytesRead;
-                    while (InternetReadFile(hUrl, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0)
-                    {
-                        outFile.write(buffer, bytesRead);
-                    }
-                    outFile.close();
-                    std::cout << "yt-dlp.exe Download complete." << std::endl;
-                }
-                else
-                {
-                    std::cerr << "Failed to open file for writing: " << destinationPath << std::endl;
-                }
-                InternetCloseHandle(hUrl);
-            }
-            else
-            {
-                std::cerr << "Failed to open URL: " << downloadUrl << std::endl;
-            }
-            InternetCloseHandle(hInternet);
+            ErrorExit("ERROR: Failed to download yt-dlp.exe!");
         }
-        else
-        {
-            std::cerr << "Failed to initialize WinINet." << std::endl;
 
-        }
+        std::cout << "yt-dlp.exe downloaded to: " << localYtDlp << std::endl;
     }
 
-
-    //cleanup downloads leftover in INetCache 
-    std::filesystem::path targetDirectory = std::filesystem::path(appDataPathStr) / "Microsoft\\Windows\\INetCache\\IE";
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(targetDirectory))
+    if (!std::filesystem::exists(localYtDlp))
     {
-        if (entry.is_regular_file() && entry.path().filename().string().rfind("yt-dlp", 0) == 0) // Check if file starts with "yt-dlp"
-        {
-            bool warned = false;
-            while (IsFileInUse(entry.path()))
-            {
-                if (!warned)
-                {
-                    warned = true;
-                    std::cout << "Leftover file is still in use. Waiting..." << std::endl;
-                }
-                Sleep(100); //wait 1/10th of a second.
-            }
-            std::filesystem::remove(entry.path());
-            std::cout << "Cleaned up leftover yt-dlp download in INetCache: " << entry.path() << std::endl;
-        }
+        ErrorExit("ERROR: yt-dlp.exe still missing after download attempt!");
     }
 
-    int duration = 0;
-    std::cout << "\nWaiting for VRChat to regenerate its custom YT-DLP." << std::endl;
+    GuardLoop(localYtDlp, ytDlpPath);
+    return 0;
+}
 
-    while (!std::filesystem::exists(ytDlpPath))
-    {
-        if (!CheckIfGameRunning(ytDlpPath.parent_path() / "yt-dlp-latest.exe"))
-        {
-            return 0;
-        }
-        if (duration > 60)
-        {
-            std::cout << "Waited a minute without VRChat replacing YT-DLP, proceeding." << "\n" << std::endl;
-            break;
-        }
-        Sleep(1000);
-        duration++;
-    }
+void workerProcess()
+{
+    exit(worker());
+}
 
-    if (std::filesystem::exists(ytDlpPath))
-    {
-        bool warned = false;
-        while (IsFileInUse(ytDlpPath))
-        {
-            if (!warned)
-            {
-                warned = true;
-                std::cout << "Waiting for VRChat to finish writing its custom YT-DLP." << std::endl;
-            }
-            if (!CheckIfGameRunning(ytDlpPath.parent_path() / "yt-dlp-latest.exe"))
-            {
-                return 0;
-            }
-            Sleep(100); //wait 1/10 of a second.
-        }
-        
-        std::filesystem::remove(ytDlpPath);
-        std::cout << "Deleting VRChat's custom YT-DLP again lol." << std::endl;
-    }
-
-    if (std::filesystem::exists(ytDlpPath.parent_path() / "yt-dlp-latest.exe"))
-    {
-        std::filesystem::rename(ytDlpPath.parent_path() / "yt-dlp-latest.exe", ytDlpPath.parent_path() / "yt-dlp.exe");
-        std::cout << "Finished replacing VRChat's YT-DLP with the official version." << std::endl;
-    }
-    std::cout << "Thanks for using. <3" << std::endl;
-
-    return 1;
+int main()
+{
+    InitAndHide();
+    std::thread(workerProcess).detach();
+    TrayMessageLoop();
 }
